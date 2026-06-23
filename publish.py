@@ -98,7 +98,8 @@ def md_to_html(md: str) -> str:
             flush_para(); flush_quote()
             if not in_list:
                 html.append("<ul>"); in_list = True
-            html.append(f"<li>{inline(re.sub(r'^[-*]\s+', '', line))}</li>")
+            item_text = re.sub(r"^[-*]\s+", "", line)
+            html.append(f"<li>{inline(item_text)}</li>")
         else:
             flush_list(); flush_quote()
             in_para.append(line)
