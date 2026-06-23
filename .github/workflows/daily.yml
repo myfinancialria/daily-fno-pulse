@@ -1,0 +1,108 @@
+name: Daily F&O Pulse
+
+on:
+  schedule:
+    # 18:30 IST = 13:00 UTC, Mon-Fri (after NSE FII derivative stats publish)
+    - cron: "0 13 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Fyers daily login
+        env:
+          FYERS_CLIENT_ID: ${{ secrets.FYERS_CLIENT_ID }}
+          FYERS_SECRET:    ${{ secrets.FYERS_SECRET }}
+          FYERS_REDIRECT:  ${{ secrets.FYERS_REDIRECT }}
+          FYERS_FY_ID:     ${{ secrets.FYERS_FY_ID }}
+          FYERS_PIN:       ${{ secrets.FYERS_PIN }}
+          FYERS_TOTP_KEY:  ${{ secrets.FYERS_TOTP_KEY }}
+        run: python auto_login.py
+
+      - name: Fetch data
+        env:
+          FYERS_CLIENT_ID: ${{ secrets.FYERS_CLIENT_ID }}
+        run: python fetcher.py
+
+      - name: Analyse
+        run: python analyzer.py
+
+      - name: Write article
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL:   ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+        run: python writer.py
+
+      - name: Render HTML + index
+        run: python publish.py
+
+      - name: Commit data + article + output
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for f in data articles output; do [ -d "$f" ] && git add "$f"; done
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "fno-pulse: $(date -u +%Y-%m-%d)"
+            for i in 1 2 3 4 5; do
+              git pull --rebase --no-edit && git push && break
+              sleep $((10 * i))
+            done
+          fi
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: output
+
+      - name: Deploy to GitHub Pages
+        id: pages
+        uses: actions/deploy-pages@v4
+
+      - name: Telegram notify success
+        if: success()
+        env:
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PAGE_URL: ${{ steps.pages.outputs.page_url }}
+        run: |
+          DATE=$(TZ=Asia/Kolkata date +'%a, %d %b')
+          MSG="📊 F&O Pulse published — ${DATE}. Read: ${PAGE_URL}"
+          if [ -n "$BOT" ] && [ -n "$CHAT" ]; then
+            RESP=$(curl -s -X POST "https://api.telegram.org/bot${BOT}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT}" \
+              --data-urlencode "text=${MSG}" \
+              --data-urlencode "disable_web_page_preview=false")
+            echo "Telegram: $RESP"
+          else
+            echo "Telegram creds not set — skipping notification"
+          fi
+
+      - name: Telegram notify failure
+        if: failure()
+        env:
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -n "$BOT" ] && [ -n "$CHAT" ]; then
+            DATE=$(TZ=Asia/Kolkata date +'%a, %d %b')
+            curl -s -X POST "https://api.telegram.org/bot${BOT}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT}" \
+              --data-urlencode "text=🔴 F&O Pulse FAILED ${DATE}. Logs: ${RUN_URL}" > /dev/null
+          fi
